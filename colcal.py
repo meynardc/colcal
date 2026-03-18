@@ -18,7 +18,7 @@ No spatial interpolation — the simplest possible approach, no demosaicing arte
 Supported patterns: RGGB, BGGR, GRBG, GBRG (selectable by the user).
 """
 
-APP_VERSION = "1.9"
+APP_VERSION = "1.16"
 
 import sys
 import os
@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QSizePolicy, QFrame, QSplitter, QGridLayout,
     QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QCheckBox, QMessageBox, QComboBox,
-    QProgressDialog, QTabWidget,
+    QProgressDialog, QTabWidget, QSlider,
 )
 from PySide6.QtGui import (
     QPixmap, QPainter, QColor, QFont, QPen, QBrush, QPolygonF, QIcon,
@@ -1172,6 +1172,7 @@ class ZoomViewerWidget(QWidget):
         # When True: no point editing (corrected-preview mode is active)
         self._interaction_locked: bool = False
 
+
         self.setMinimumSize(100, 100)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMouseTracking(True)
@@ -1212,6 +1213,7 @@ class ZoomViewerWidget(QWidget):
         """Lock or unlock point drag / add (used during corrected-preview mode)."""
         self._interaction_locked = locked
         self.setCursor(Qt.ArrowCursor if locked else Qt.CrossCursor)
+
 
     def setGrid(self, cols: int, rows: int, gap: float):
         self._grid_cols = max(1, cols); self._grid_rows = max(1, rows)
@@ -2304,16 +2306,22 @@ def auto_detect_quad(
         cell_w_px = wt * TILE / max(cols_p, 1)
         cell_h_px = ht * TILE / max(rows_p, 1)
 
-        def _locate_cells(expected_pts):
+        def _locate_cells(expected_pts, pct_start=65, pct_end=75):
             """
             For each cell, search the ENTIRE ROI for pixels whose colour
             (after correction) is close to the reference, find all blobs,
             keep the blob whose centroid is closest to the expected centre.
             No rectangular window → no shape bias.
+            Calls _pcb per cell so the user can cancel during this phase.
             """
             sp, dp, dbg = [], [], []
+            n_cells = len(expected_pts)
 
-            for ci, (ex, ey) in expected_pts.items():
+            for idx, (ci, (ex, ey)) in enumerate(expected_pts.items()):
+                # Per-cell progress + cancellation check
+                pct = pct_start + int((pct_end - pct_start) * idx / max(n_cells, 1))
+                _pcb(pct, f"Fine localisation — cell {idx+1}/{n_cells}…")
+
                 col_r, row_r = ref_coords[ci]
                 target = ref_lab[ci]   # (3,) Lab
 
@@ -2322,7 +2330,6 @@ def auto_detect_quad(
                     (roi_corr.reshape(-1, 3) - target) ** 2, axis=1
                 )).reshape(rh, rw)
 
-                # Seuil : percentile 8% des pixels (les plus proches de la couleur)
                 # Select pixels that "look like" this cell
                 thr = float(np.percentile(de_roi, 8))
                 thr = max(thr, 5.0)   # at least 5 Lab units
@@ -2331,7 +2338,6 @@ def auto_detect_quad(
                 if mask_roi.sum() < 4:
                     continue
 
-                # Trouver tous les blobs
                 if _HAVE_CV2:
                     n_lab, lab_img = _cv2.connectedComponents(mask_roi, connectivity=4)
                     if n_lab <= 1:
@@ -2376,13 +2382,11 @@ def auto_detect_quad(
                 if not blob_cx:
                     continue
 
-                # Garder le blob le plus proche du centre attendu
                 # weighted by size (prefers large nearby blobs)
                 blob_cx = np.array(blob_cx)
                 blob_cy = np.array(blob_cy)
                 blob_sz = np.array(blob_sz, dtype=np.float64)
                 dist_to_expected = np.sqrt((blob_cx - ex)**2 + (blob_cy - ey)**2)
-                # Score = distance / log(taille+2) — favorise grands blobs proches
                 score = dist_to_expected / np.log(blob_sz + 2)
                 best = int(np.argmin(score))
 
@@ -2403,7 +2407,7 @@ def auto_detect_quad(
                          (y0t + ref_coords[ci][1] / denom_r * ht) * TILE)
                     for ci in range(M_cells)}
 
-        sp1, dp1, dbg1 = _locate_cells(exp_pts1)
+        sp1, dp1, dbg1 = _locate_cells(exp_pts1, pct_start=65, pct_end=72)
 
         # Intermediate homography to re-centre the windows
         H_iter1 = None
@@ -2447,7 +2451,7 @@ def auto_detect_quad(
             pred = _apply_H(H_iter1, all_grid)   # (M, 2) work pixels
             exp_pts2 = {ci: (float(pred[ci, 0]), float(pred[ci, 1]))
                         for ci in range(M_cells)}
-            sp2, dp2, dbg2 = _locate_cells(exp_pts2)
+            sp2, dp2, dbg2 = _locate_cells(exp_pts2, pct_start=72, pct_end=78)
             if len(sp2) >= len(sp1):
                 src_pts, dst_pts = sp2, dp2
                 _dbg_pts.extend(dbg2)
@@ -2607,6 +2611,7 @@ class MainWindow(QWidget):
 
         self._pixmap_orig:     QPixmap | None = None
         self._rotation:        int            = 0
+        self._brightness:      int            = 0   # display-only boost (0–200)
         self._img_orig_size:   tuple          = (0, 0)
         self._last_image_dir:  str            = ""
         self._last_matrix_dir: str            = ""
@@ -2626,6 +2631,11 @@ class MainWindow(QWidget):
         self._table_debounce.setSingleShot(True)
         self._table_debounce.setInterval(600)
         self._table_debounce.timeout.connect(self._refresh_cell_table)
+
+        self._brightness_debounce = QTimer(self)
+        self._brightness_debounce.setSingleShot(True)
+        self._brightness_debounce.setInterval(120)
+        self._brightness_debounce.timeout.connect(self._apply_brightness_update)
 
         self._setup_ui()
         self._apply_styles()
@@ -2695,10 +2705,45 @@ class MainWindow(QWidget):
         # ── Left column: zoomed view (stretches) + bottom bar ──
         left_col = QWidget()
         left_lay = QVBoxLayout(left_col); left_lay.setContentsMargins(0, 0, 0, 0); left_lay.setSpacing(4)
-        left_lay.addWidget(self._labeled(
-            self.zoom_viewer,
-            "Zoomed view  —  wheel/↑↓=zoom  |  Shift+wheel=gap  |  drag=pan  |  click=point  |  right-click/Del=clear"
-        ), stretch=1)
+
+        # Zoom viewer + brightness slider side by side
+        zoom_row = QHBoxLayout(); zoom_row.setContentsMargins(0, 0, 0, 0); zoom_row.setSpacing(4)
+
+        # Vertical brightness slider on the left of the zoom view
+        bright_col = QVBoxLayout(); bright_col.setContentsMargins(0, 0, 0, 0); bright_col.setSpacing(2)
+        lbl_bright_top = QLabel("☀"); lbl_bright_top.setAlignment(Qt.AlignHCenter)
+        lbl_bright_top.setToolTip("Display brightness boost\n(view only — saved images are never affected)")
+        lbl_bright_top.setStyleSheet("color: #ffdd88; font-size: 20px;")
+        self.slider_brightness = QSlider(Qt.Vertical)
+        self.slider_brightness.setRange(0, 200)
+        self.slider_brightness.setValue(0)
+        self.slider_brightness.setFixedWidth(22)
+        # Default Qt vertical slider: min at bottom, max at top — correct as-is
+        self.slider_brightness.setToolTip(
+            "Display brightness boost (0–200 levels added to each pixel).\n"
+            "Top = maximum boost, bottom = no boost.\n"
+            "Applies to the viewer only — saved/exported images are never affected.\n"
+            "Disabled in corrected-preview mode."
+        )
+        self.slider_brightness.valueChanged.connect(self._on_brightness_changed)
+        lbl_bright_bot = QLabel("○"); lbl_bright_bot.setAlignment(Qt.AlignHCenter)
+        lbl_bright_bot.setStyleSheet("color: #666688; font-size: 11px;")
+        bright_col.addWidget(lbl_bright_top)
+        bright_col.addWidget(self.slider_brightness, stretch=1)
+        bright_col.addWidget(lbl_bright_bot)
+
+        bright_wrap = QWidget(); bright_wrap.setLayout(bright_col); bright_wrap.setFixedWidth(26)
+        zoom_row.addWidget(bright_wrap)
+        zoom_row.addWidget(self.zoom_viewer, stretch=1)
+
+        zoom_wrap = QWidget(); zoom_lay = QVBoxLayout(zoom_wrap)
+        zoom_lay.setContentsMargins(0, 0, 0, 0); zoom_lay.setSpacing(4)
+        lbl_zoom = QLabel("Zoomed view  —  wheel/↑↓=zoom  |  Shift+wheel=gap  |  drag=pan  |  click=point  |  right-click/Del=clear")
+        lbl_zoom.setObjectName("panelTitle")
+        zoom_lay.addWidget(lbl_zoom)
+        zoom_lay.addLayout(zoom_row, stretch=1)
+
+        left_lay.addWidget(zoom_wrap, stretch=1)
         left_lay.addWidget(_make_separator())
 
         # Bottom bar: grid settings | measured palette | color matrix | reference palette
@@ -3010,13 +3055,18 @@ class MainWindow(QWidget):
 
         self._prev_rotation = self._rotation
 
-        # Build the rotated display pixmap
+        # Build the rotated display pixmap (rotation + optional colour correction)
         if self._rotation == 0.0:
             px = self._pixmap_orig
         else:
             t = QTransform(); t.rotate(self._rotation)
             px = self._pixmap_orig.transformed(t, Qt.SmoothTransformation)
         px = self._apply_correction_if_needed(px)
+
+        # Cache this as the "base" for fast brightness updates
+        self._pixmap_display_base = px
+
+        px = self._apply_brightness_if_needed(px)
 
         # Always pass rotation=0: quad points and center are already in display space
         self.viewer.setPixmap(px)
@@ -3130,19 +3180,25 @@ class MainWindow(QWidget):
         if self._pixmap_orig is None or self._ref_palette is None:
             return
 
-        # Progress dialog — shown immediately, before the heavy computation
-        prog = QProgressDialog("Preparing…", None, 0, 100, self)
+        # Progress dialog with Cancel button
+        prog = QProgressDialog("Preparing…", "Cancel", 0, 100, self)
         prog.setWindowTitle("🎯  Auto-detect")
         prog.setWindowModality(Qt.WindowModal)
         prog.setMinimumDuration(0)
         prog.setValue(0)
         QApplication.processEvents()
 
+        class _Cancelled(Exception):
+            pass
+
         def _progress(pct: int, msg: str):
             prog.setValue(pct)
             prog.setLabelText(msg)
             QApplication.processEvents()
+            if prog.wasCanceled():
+                raise _Cancelled()
 
+        cancelled = False
         try:
             with _wait_cursor():
                 # Build the rotated display pixmap (same as shown to the user)
@@ -3161,11 +3217,15 @@ class MainWindow(QWidget):
 
                 result_rot, dbg_pts, all_found, n_interpolated = auto_detect_quad(
                     arr, self._ref_palette, progress_cb=_progress)
+        except _Cancelled:
+            cancelled = True
         finally:
             prog.setValue(100)
             prog.close()
 
-        if result_rot is None:
+        if cancelled:
+            self.zoom_viewer.setInteractionLocked(False)
+            return   # clean state — nothing was modified
             QMessageBox.warning(
                 self, "Auto-detect failed",
                 "Could not automatically locate the colour chart.\n\n"
@@ -3263,17 +3323,23 @@ class MainWindow(QWidget):
         if px1 - px0 < 8 or py1 - py0 < 8:
             return
 
-        prog = QProgressDialog("Preparing…", None, 0, 100, self)
+        prog = QProgressDialog("Preparing…", "Cancel", 0, 100, self)
         prog.setWindowTitle("🔍  Detect in zoom")
         prog.setWindowModality(Qt.WindowModal)
         prog.setMinimumDuration(0)
         prog.setValue(0)
         QApplication.processEvents()
 
+        class _Cancelled(Exception):
+            pass
+
         def _progress(pct: int, msg: str):
             prog.setValue(pct); prog.setLabelText(msg)
             QApplication.processEvents()
+            if prog.wasCanceled():
+                raise _Cancelled()
 
+        cancelled = False
         try:
             with _wait_cursor():
                 qimg = px_display.toImage().convertToFormat(QImage.Format_RGB888)
@@ -3285,10 +3351,14 @@ class MainWindow(QWidget):
 
                 result_crop, dbg_pts, all_found, n_interpolated = auto_detect_quad(
                     crop_arr, self._ref_palette, progress_cb=_progress)
+        except _Cancelled:
+            cancelled = True
         finally:
             prog.setValue(100); prog.close()
 
-        if result_crop is None:
+        if cancelled:
+            self.zoom_viewer.setInteractionLocked(False)
+            return   # clean state — nothing was modified
             QMessageBox.warning(
                 self, "Detect in zoom — failed",
                 "Could not locate the colour chart in the current view.\n\n"
@@ -3685,6 +3755,33 @@ class MainWindow(QWidget):
             return pixmap
         return self._apply_matrix_to_pixmap(pixmap, M, self.color_matrix.offset())
 
+    def _apply_brightness_if_needed(self, pixmap: QPixmap) -> QPixmap:
+        """Add a brightness boost to the display pixmap (view only, not corrected mode)."""
+        if self._corrected_mode or self._brightness == 0:
+            return pixmap
+        img  = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB32)
+        w, h = img.width(), img.height()
+        arr  = np.frombuffer(img.bits(), dtype=np.uint8).reshape((h, w, 4)).copy()
+        rgb  = arr[:, :, :3].astype(np.int16)
+        rgb  = np.clip(rgb + self._brightness, 0, 255).astype(np.uint8)
+        arr[:, :, :3] = rgb
+        return QPixmap.fromImage(QImage(arr.tobytes(), w, h, w * 4, QImage.Format.Format_RGB32))
+
+    def _on_brightness_changed(self, value: int):
+        self._brightness = value
+        self._brightness_debounce.start()
+
+    def _apply_brightness_update(self):
+        """Called by the debounce timer — applies brightness to the cached base pixmap."""
+        base = getattr(self, '_pixmap_display_base', None)
+        if base is None or self._corrected_mode:
+            self._apply_rotation()
+            return
+        # Apply real numpy boost to the cached base pixmap
+        px = self._apply_brightness_if_needed(base)
+        self.viewer.setPixmap(px)
+        self.zoom_viewer.updatePixmap(px, 0)
+
     def _apply_matrix_to_pixmap(self, pixmap: QPixmap, M: np.ndarray,
                                  offset: np.ndarray | None = None) -> QPixmap:
         """Apply M (3×3) [+ offset (3)] to every pixel. Returns a new QPixmap."""
@@ -3709,6 +3806,7 @@ class MainWindow(QWidget):
         self._corrected_mode = on
         self.zoom_viewer.setInteractionLocked(on)
         self.grid_settings.setEnabled(not on)
+        self.slider_brightness.setEnabled(not on)
 
         M = self.color_matrix.matrix()
         with _wait_cursor():
@@ -3722,7 +3820,9 @@ class MainWindow(QWidget):
                     offset     = self.color_matrix.offset()
                     display_px = self._apply_matrix_to_pixmap(px_rotated, M, offset)
                 else:
-                    display_px = px_rotated
+                    # Exiting corrected mode — restore base and apply brightness
+                    self._pixmap_display_base = px_rotated
+                    display_px = self._apply_brightness_if_needed(px_rotated)
                 self.zoom_viewer.updatePixmap(display_px, 0)
                 self.viewer.setPixmap(display_px)
 
@@ -3755,7 +3855,8 @@ class MainWindow(QWidget):
     def _open_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open image", self._last_image_dir,
-            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tiff *.tif *.ppm *.pgm *.raw *.dng *.nef *.cr2 *.arw);;All files (*)"
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tiff *.tif *.ppm *.pgm *.raw *.dng *.nef *.cr2 *.arw"
+            " *.PNG *.JPG *.JPEG *.BMP *.GIF *.WEBP *.TIFF *.TIF *.PPM *.PGM *.RAW *.DNG *.NEF *.CR2 *.ARW);;All files (*)"
         )
         if not path: return
         pixmap = QPixmap(path)
@@ -3795,8 +3896,9 @@ class MainWindow(QWidget):
 
     def _load_pixmap(self, pixmap: QPixmap, path: str):
         """Common finalisation after any pixmap is ready (normal or debayered)."""
-        self._pixmap_orig   = pixmap
-        self._rotation      = 0.0
+        self._pixmap_orig          = pixmap
+        self._pixmap_display_base  = None   # invalidate brightness cache
+        self._rotation             = 0.0
         self._img_orig_size = (pixmap.width(), pixmap.height())
         self._apply_rotation(); self._update_rotation_ui()
         self.zoom_viewer.setPixmap(pixmap)
@@ -3925,8 +4027,8 @@ class MainWindow(QWidget):
         default_name = os.path.join(self._last_image_dir, f"{base}_corrected.png")
         path, _      = QFileDialog.getSaveFileName(
             self, "Save corrected image", default_name,
-            "PNG lossless (*.png);;TIFF lossless (*.tiff *.tif);;BMP lossless (*.bmp);;"
-            "JPEG (lossy, not recommended) (*.jpg *.jpeg)"
+            "PNG lossless (*.png *.PNG);;TIFF lossless (*.tiff *.tif *.TIFF *.TIF);;"
+            "BMP lossless (*.bmp *.BMP);;JPEG (lossy, not recommended) (*.jpg *.jpeg *.JPG *.JPEG)"
         )
         if not path: return
         with _wait_cursor():
@@ -3966,9 +4068,8 @@ class MainWindow(QWidget):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Select images to correct",
             self._last_image_dir,
-            "Images (*.png *.jpg *.jpeg *.tiff *.tif *.bmp "
-            "*.PNG *.JPG *.JPEG *.TIFF *.TIF *.BMP);;"
-            "All files (*)"
+            "Images (*.png *.jpg *.jpeg *.tiff *.tif *.bmp *.webp *.ppm *.pgm"
+            " *.PNG *.JPG *.JPEG *.TIFF *.TIF *.BMP *.WEBP *.PPM *.PGM);;All files (*)"
         )
         if not paths:
             return
@@ -4270,6 +4371,33 @@ class MainWindow(QWidget):
             }
             QCheckBox::indicator:checked { background: #5555aa; border-color: #8888dd; }
             QCheckBox::indicator:hover   { border-color: #7a7abf; }
+
+            QSlider::groove:vertical {
+                background: #1a1a2e; border: 1px solid #3a3a5a;
+                width: 8px; border-radius: 4px;
+            }
+            QSlider::groove:vertical:disabled {
+                background: #111118; border-color: #222230;
+            }
+            QSlider::handle:vertical {
+                background: #ffdd88; border: 1px solid #ccaa44;
+                height: 14px; width: 18px; margin: 0 -5px;
+                border-radius: 4px;
+            }
+            QSlider::handle:vertical:hover    { background: #ffe8aa; }
+            QSlider::handle:vertical:disabled { background: #2a2a3a; border-color: #1e1e2e; }
+            QSlider::add-page:vertical {
+                background: #aaaaaa; border-radius: 4px;
+            }
+            QSlider::add-page:vertical:disabled {
+                background: transparent;
+            }
+            QSlider::sub-page:vertical {
+                background: #333344; border-radius: 4px;
+            }
+            QSlider::sub-page:vertical:disabled {
+                background: transparent;
+            }
 
             QTableWidget#coordTable {
                 background-color: #12121e; alternate-background-color: #1a1a2e;
