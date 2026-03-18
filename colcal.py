@@ -18,7 +18,7 @@ No spatial interpolation — the simplest possible approach, no demosaicing arte
 Supported patterns: RGGB, BGGR, GRBG, GBRG (selectable by the user).
 """
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.9"
 
 import sys
 import os
@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QSizePolicy, QFrame, QSplitter, QGridLayout,
     QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QCheckBox, QMessageBox, QComboBox,
-    QProgressDialog,
+    QProgressDialog, QTabWidget,
 )
 from PySide6.QtGui import (
     QPixmap, QPainter, QColor, QFont, QPen, QBrush, QPolygonF, QIcon,
@@ -356,8 +356,10 @@ class MeasuredPaletteWidget(_BasePaletteWidget):
 class ColorMatrixWidget(QWidget):
     """
     Displays the least-squares color transformation matrix.
-      9-param mode  : rgb_out = M @ rgb_in
-      12-param mode : rgb_out = M @ rgb_in + offset
+      Direct mode  : minimise ‖ M · measured − reference ‖  →  apply M to image
+      Inverse mode : minimise ‖ F · reference − measured ‖  →  apply F⁻¹ to image
+                     (more statistically rigorous: error is in the noisy domain)
+      Both support an optional +offset (affine term).
     """
 
     computeRequested = Signal()
@@ -367,8 +369,8 @@ class ColorMatrixWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._matrix: np.ndarray | None = None  # shape (3, 3)
-        self._offset: np.ndarray | None = None  # shape (3,) or None
+        self._matrix: np.ndarray | None = None  # shape (3, 3) — always the APPLICATION matrix
+        self._offset: np.ndarray | None = None  # shape (3,) or None — always the APPLICATION offset
         self._residuals: tuple | None   = None
         self._setup_ui()
 
@@ -379,11 +381,23 @@ class ColorMatrixWidget(QWidget):
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(6)
 
-        # Header row: title + offset checkbox + Compute button
+        # Header row: title + inverse checkbox + offset checkbox + Compute button
         hdr = QHBoxLayout()
         hdr.setSpacing(6)
         lbl = QLabel("Matrix M"); lbl.setObjectName("panelTitle")
         hdr.addWidget(lbl, stretch=1)
+        self.chk_inverse = QCheckBox("Inverse")
+        self.chk_inverse.setToolTip(
+            "Inverse model (recommended):\n"
+            "  Fits F such that F · reference ≈ measured\n"
+            "  then applies F⁻¹ to the image.\n"
+            "  Residuals measure fit quality in the noisy (measured) space.\n\n"
+            "Direct model (default):\n"
+            "  Fits M such that M · measured ≈ reference\n"
+            "  then applies M to the image."
+        )
+        self.chk_inverse.setObjectName("offsetChk")
+        hdr.addWidget(self.chk_inverse)
         self.chk_offset = QCheckBox("+offset")
         self.chk_offset.setToolTip("12-parameter affine transform: M @ rgb + offset\n(corrects a global brightness/colour shift)")
         self.chk_offset.setObjectName("offsetChk")
@@ -432,6 +446,8 @@ class ColorMatrixWidget(QWidget):
 
         self.chk_offset.toggled.connect(self._on_offset_toggled)
         self._on_offset_toggled(False)
+        self.chk_inverse.setChecked(True)
+        self.chk_inverse.toggled.connect(self._on_inverse_toggled)
 
         lay.addWidget(_make_separator())
 
@@ -500,6 +516,11 @@ class ColorMatrixWidget(QWidget):
         if self._matrix is not None:
             self.btn_calc.setEnabled(True)
 
+    def _on_inverse_toggled(self, checked: bool):
+        """Re-enable Compute when switching modes if a matrix already exists."""
+        if self._matrix is not None:
+            self.btn_calc.setEnabled(True)
+
     def _on_toggle(self, checked: bool):
         self.btn_toggle.setText("✅  Corrected" if checked else "👁  Preview")
         self.toggleCorrected.emit(checked)
@@ -509,6 +530,9 @@ class ColorMatrixWidget(QWidget):
     def use_offset(self) -> bool:
         return self.chk_offset.isChecked()
 
+    def use_inverse(self) -> bool:
+        return self.chk_inverse.isChecked()
+
     def matrix(self) -> np.ndarray | None:
         return self._matrix
 
@@ -516,7 +540,8 @@ class ColorMatrixWidget(QWidget):
         return self._offset
 
     def setResult(self, matrix: np.ndarray, residuals: tuple,
-                  offset: np.ndarray | None = None, source_name: str = ""):
+                  offset: np.ndarray | None = None, source_name: str = "",
+                  mode_tag: str = ""):
         self._matrix    = matrix
         self._offset    = offset
         self._residuals = residuals
@@ -551,12 +576,12 @@ class ColorMatrixWidget(QWidget):
                 color = "#ff5555" if val > 5 else ("#ffaa44" if val > 2 else "#55dd88")
                 lbl.setStyleSheet(f"color: {color}; font-family: 'Consolas', monospace; font-size: 12px;")
 
-        # Source label
         if source_name:
             self.lbl_source.setText(f"📂  Imported: {source_name}")
             self.lbl_source.setStyleSheet("color: #ffaa44; font-size: 11px;")
         else:
-            self.lbl_source.setText("⚙  Computed")
+            tag = f"  [{mode_tag}]" if mode_tag else ""
+            self.lbl_source.setText(f"⚙  Computed{tag}")
             self.lbl_source.setStyleSheet("color: #55dd88; font-size: 11px;")
 
     def setError(self, msg: str):
@@ -579,6 +604,203 @@ class ColorMatrixWidget(QWidget):
         self.btn_toggle.setChecked(False)
         self.btn_toggle.setText("👁  Preview")
         self.btn_toggle.blockSignals(False)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ResidualChartWidget — per-patch residuals bar chart (R, G, B, total)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ResidualChartWidget(QWidget):
+    """
+    Draws per-patch residual bars for R, G, B channels and total.
+    X axis : patch index (left→right, top→bottom order of the palette).
+    Y axis : signed residual or amplitude (|residual|) in sRGB 0–255 units.
+    Hover  : tooltip showing patch label and residual values.
+    """
+
+    COLORS = {
+        "R":   QColor("#ff6060"),
+        "G":   QColor("#44dd88"),
+        "B":   QColor("#6699ff"),
+        "tot": QColor("#dddddd"),
+    }
+    CHANNELS = ["R", "G", "B", "tot"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._residuals:    np.ndarray | None = None   # (N, 4) signed — R,G,B,tot
+        self._patch_labels: list[str]         = []
+        self.setMinimumHeight(120)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._active_channels = {"R", "G", "B", "tot"}
+        self._amplitude = False    # False = signed, True = |value|
+        self.setMouseTracking(True)
+        self._hover_idx = -1       # hovered patch index (-1 = none)
+        # Pre-computed bar geometry for hit-testing: list of (patch_idx, ch, x, y, w, h)
+        self._bar_rects: list[tuple] = []
+
+    def setResiduals(self, residuals: np.ndarray, patch_labels: list[str]):
+        """residuals: (N,4) signed array — columns R, G, B, total."""
+        self._residuals    = residuals
+        self._patch_labels = patch_labels
+        self._bar_rects    = []
+        self._hover_idx    = -1
+        self.update()
+
+    def clear(self):
+        self._residuals = None; self._patch_labels = []; self._bar_rects = []
+        self._hover_idx = -1
+        self.update()
+
+    def toggleChannel(self, ch: str, visible: bool):
+        if visible: self._active_channels.add(ch)
+        else:       self._active_channels.discard(ch)
+        self._bar_rects = []
+        self.update()
+
+    def setAmplitude(self, amplitude: bool):
+        self._amplitude = amplitude
+        self._bar_rects = []
+        self.update()
+
+    # ── Mouse events ──────────────────────────────────────────────────────────
+
+    def mouseMoveEvent(self, event):
+        px, py = event.position().x(), event.position().y()
+        hit = -1
+        for (pi, _ch, bx, by, bw, bh) in self._bar_rects:
+            if bx <= px <= bx + bw and by <= py <= by + bh:
+                hit = pi
+                break
+        if hit != self._hover_idx:
+            self._hover_idx = hit
+            self.update()
+            if hit >= 0 and self._residuals is not None:
+                lbl  = self._patch_labels[hit] if hit < len(self._patch_labels) else str(hit + 1)
+                res  = self._residuals[hit]
+                tip  = (f"Patch {hit + 1}  (row {lbl.split(',')[0]}, col {lbl.split(',')[1]})\n"
+                        f"  R   : {res[0]:+.2f}\n"
+                        f"  G   : {res[1]:+.2f}\n"
+                        f"  B   : {res[2]:+.2f}\n"
+                        f"  tot : {res[3]:+.2f}")
+                from PySide6.QtWidgets import QToolTip
+                QToolTip.showText(event.globalPosition().toPoint(), tip, self)
+            else:
+                from PySide6.QtWidgets import QToolTip
+                QToolTip.hideText()
+
+    def leaveEvent(self, _event):
+        self._hover_idx = -1
+        self.update()
+
+    # ── Painting ──────────────────────────────────────────────────────────────
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        p.fillRect(self.rect(), QColor("#0d0d1a"))
+
+        if self._residuals is None or len(self._residuals) == 0:
+            p.setPen(QColor("#4a4a6a"))
+            p.drawText(self.rect(), Qt.AlignCenter, "No residuals — compute a matrix first")
+            return
+
+        data  = np.abs(self._residuals) if self._amplitude else self._residuals
+        N     = len(data)
+        W, H  = self.width(), self.height()
+        ML, MR, MT, MB = 40, 8, 10, 20
+        chart_w = W - ML - MR
+        chart_h = H - MT - MB
+
+        # Y range
+        max_abs  = max(float(np.abs(data).max()), 1.0)
+        if self._amplitude:
+            y_min, y_max = 0.0, max_abs * 1.15
+        else:
+            y_max = max_abs * 1.15;  y_min = -y_max
+
+        y_span = y_max - y_min
+
+        def to_y(v):
+            return int(MT + chart_h * (1.0 - (v - y_min) / y_span))
+
+        zero_y = to_y(0)
+
+        # ── Grid lines — ~6 ticks ─────────────────────────────────────────────
+        import math as _math
+        raw_step = y_span / 6
+        magnitude = 10 ** _math.floor(_math.log10(max(raw_step, 0.1)))
+        nice = [1, 2, 2.5, 5, 10]
+        tick_step = magnitude * min(nice, key=lambda x: abs(x - raw_step / magnitude))
+        tick_step = max(tick_step, 0.5)
+
+        first_tick = _math.ceil(y_min / tick_step) * tick_step
+        ticks = []
+        v = first_tick
+        while v <= y_max + 1e-9:
+            ticks.append(v); v += tick_step
+
+        p.setPen(QPen(QColor("#1e1e3a"), 1))
+        p.setFont(QFont("Consolas", 8))
+        for tv in ticks:
+            ty = to_y(tv)
+            if MT <= ty <= MT + chart_h:
+                p.setPen(QPen(QColor("#1e1e3a"), 1))
+                p.drawLine(ML, ty, W - MR, ty)
+                p.setPen(QColor("#5a5a8a"))
+                lbl = f"{tv:+.0f}" if not self._amplitude else f"{tv:.0f}"
+                p.drawText(0, ty - 7, ML - 3, 14,
+                           Qt.AlignRight | Qt.AlignVCenter, lbl)
+
+        # Zero line (signed mode only)
+        if not self._amplitude:
+            p.setPen(QPen(QColor("#4a4a6a"), 1))
+            p.drawLine(ML, zero_y, W - MR, zero_y)
+
+        # ── Bars ──────────────────────────────────────────────────────────────
+        active      = [ch for ch in self.CHANNELS if ch in self._active_channels]
+        bar_group_w = chart_w / max(N, 1)
+        bar_w       = max(1, int(bar_group_w / max(len(active) + 1, 2)))
+        new_rects   = []
+
+        for i in range(N):
+            gx0      = ML + int(i * bar_group_w)
+            is_hover = (i == self._hover_idx)
+            for j, ch in enumerate(active):
+                ci  = self.CHANNELS.index(ch)
+                val = float(data[i, ci])
+                x   = gx0 + j * (bar_w + 1)
+                y1  = to_y(val)
+                y0  = zero_y if not self._amplitude else to_y(0)
+                col = QColor(self.COLORS[ch])
+                if is_hover:
+                    col = col.lighter(160)
+                bx  = x;         by  = min(y0, y1)
+                bw  = bar_w;     bh  = max(1, abs(y1 - y0))
+                p.fillRect(bx, by, bw, bh, col)
+                new_rects.append((i, ch, float(bx), float(by), float(bw), float(bh)))
+
+        self._bar_rects = new_rects
+
+        # ── X axis patch labels ───────────────────────────────────────────────
+        p.setPen(QColor("#5a5a7a"))
+        p.setFont(QFont("Consolas", 7))
+        step = max(1, N // 12)
+        for i in range(0, N, step):
+            gx  = ML + int((i + 0.5) * bar_group_w)
+            lbl = self._patch_labels[i] if i < len(self._patch_labels) else str(i)
+            p.drawText(gx - 14, H - MB, 28, MB, Qt.AlignCenter, lbl)
+
+        # ── Legend ────────────────────────────────────────────────────────────
+        lx = ML + 4
+        p.setFont(QFont("Segoe UI", 8))
+        for ch in self.CHANNELS:
+            if ch not in self._active_channels:
+                continue
+            p.fillRect(lx, MT, 8, 8, self.COLORS[ch])
+            p.setPen(QColor("#c0c0e0"))
+            p.drawText(lx + 10, MT, 28, 10, Qt.AlignLeft | Qt.AlignVCenter, ch)
+            lx += 40
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2567,11 +2789,61 @@ class MainWindow(QWidget):
         # Vertical splitter: small full view on top, large table on bottom
         right_vsplit = QSplitter(Qt.Vertical); right_vsplit.setHandleWidth(5)
         right_vsplit.setChildrenCollapsible(False); right_vsplit.addWidget(self.viewer)
+
+        # Tab widget: Stats | Residuals
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setObjectName("rightTabs")
+
+        # Tab 0 — Cell statistics
         cell_wrap = QWidget()
         cell_lay  = QVBoxLayout(cell_wrap); cell_lay.setContentsMargins(0, 2, 0, 0); cell_lay.setSpacing(2)
         lbl_table = QLabel("Cell statistics  —  row, col, # px, color, σ"); lbl_table.setObjectName("panelTitle")
         cell_lay.addWidget(lbl_table); cell_lay.addWidget(self.cell_table)
-        right_vsplit.addWidget(cell_wrap); right_vsplit.setSizes([220, 460])
+        self.right_tabs.addTab(cell_wrap, "Patch stats")
+        self.right_tabs.tabBar().setTabToolTip(0,
+            "Per-patch sampling statistics: pixel count, mean colour and std-dev.\n"
+            "Patches with high std-dev (noisy sampling) are highlighted in red.")
+
+        # Tab 1 — Residuals chart
+        res_wrap = QWidget()
+        res_lay  = QVBoxLayout(res_wrap); res_lay.setContentsMargins(4, 4, 4, 4); res_lay.setSpacing(4)
+        # Create chart first so signal connections below can reference it
+        self.residual_chart = ResidualChartWidget()
+        # Controls bar: channel toggles + signed/amplitude toggle
+        ch_bar = QHBoxLayout(); ch_bar.setSpacing(8)
+        self._res_ch_checks: dict[str, QCheckBox] = {}
+        _ch_tips = {
+            "R":   "Show / hide Red channel residuals",
+            "G":   "Show / hide Green channel residuals",
+            "B":   "Show / hide Blue channel residuals",
+            "tot": "Show / hide total residual\n(signed RMS across R, G, B)",
+        }
+        for ch, col in [("R","#ff6060"),("G","#44dd88"),("B","#6699ff"),("tot","#dddddd")]:
+            chk = QCheckBox(ch); chk.setChecked(True)
+            chk.setStyleSheet(f"QCheckBox {{ color: {col}; font-family: Consolas; }}")
+            chk.setToolTip(_ch_tips[ch])
+            ch_name = ch
+            chk.toggled.connect(lambda on, c=ch_name: self.residual_chart.toggleChannel(c, on))
+            self._res_ch_checks[ch] = chk
+            ch_bar.addWidget(chk)
+        ch_bar.addSpacing(12)
+        self._chk_amplitude = QCheckBox("Amplitude")
+        self._chk_amplitude.setChecked(False)
+        self._chk_amplitude.setToolTip("Show absolute values (amplitude) instead of signed residuals")
+        self._chk_amplitude.toggled.connect(self.residual_chart.setAmplitude)
+        ch_bar.addWidget(self._chk_amplitude)
+        ch_bar.addStretch()
+        res_lay.addLayout(ch_bar)
+        res_lay.addWidget(self.residual_chart, stretch=1)
+        self.right_tabs.addTab(res_wrap, "Fit residuals")
+        self.right_tabs.tabBar().setTabToolTip(1,
+            "Per-patch residuals of the colour correction fit (sRGB 0–255 units).\n"
+            "Signed mode: positive = under-predicted, negative = over-predicted.\n"
+            "Amplitude mode: absolute error regardless of direction.\n"
+            "Hover a bar to see the exact values for that patch.")
+
+        right_vsplit.addWidget(self.right_tabs)
+        right_vsplit.setSizes([220, 460])
         right_vsplit.setStretchFactor(0, 1); right_vsplit.setStretchFactor(1, 3)
         right_lay.addWidget(right_vsplit, stretch=1)
         self._right_vsplit = right_vsplit
@@ -3286,27 +3558,26 @@ class MainWindow(QWidget):
 
     def _compute_color_matrix(self):
         """
-        Least-squares color transform.
-          9-param  : A (N×3) @ X ≈ B  →  M = X.T
-          12-param : A_aug (N×4) @ X ≈ B  →  M = X[:3].T, offset = X[3]
+        Least-squares color transform with optional grey-patch weighting.
+        Direct  : minimise ‖ W½(M·measured − reference) ‖  → apply M
+        Inverse : minimise ‖ W½(F·reference − measured) ‖  → apply F⁻¹
         Always samples raw colours from pixmap_orig, regardless of preview mode.
         """
         def fail(msg):
-            self.color_matrix.setError(msg); self._refresh_save_corrected_btn()
+            self.color_matrix.setError(msg)
+            self.residual_chart.clear(); self._refresh_save_corrected_btn()
 
         if self._ref_palette is None:
             return fail("No reference palette loaded.")
         if self._pixmap_orig is None:
             return fail("No image loaded.")
 
-        # Always re-sample from pixmap_orig to get raw (uncorrected) cell colours
         iw, ih = self._img_orig_size
         if iw == 0 or ih == 0 or len(self.zoom_viewer._quad_points) != 4:
             return fail("No measured colors (place 4 points).")
         orig_pts = self._quad_pts_to_orig()
         cells    = self.zoom_viewer.getCellCorners(iw, ih, self._pixmap_orig,
                                                    quad_override=orig_pts)
-        # Build measured palette from raw samples
         rows_g = self.zoom_viewer._grid_rows
         cols_g = self.zoom_viewer._grid_cols
         measured = [[None] * cols_g for _ in range(rows_g)]
@@ -3321,42 +3592,77 @@ class MainWindow(QWidget):
         if rows_m != rows_r or cols_m != cols_r:
             return fail(f"Dimension mismatch: measured {rows_m}×{cols_m} ≠ ref {rows_r}×{cols_r}")
 
-        A_rows, B_rows = [], []
+        meas_rows, ref_rows, patch_labels = [], [], []
         for r in range(rows_m):
             for c in range(cols_m):
                 m = measured[r][c] if c < len(measured[r]) else None
                 b = ref[r][c]      if c < len(ref[r])      else None
                 if m is not None and b is not None:
-                    A_rows.append([float(m[0]), float(m[1]), float(m[2])])
-                    B_rows.append([float(b[0]), float(b[1]), float(b[2])])
+                    meas_rows.append([float(m[0]), float(m[1]), float(m[2])])
+                    ref_rows .append([float(b[0]), float(b[1]), float(b[2])])
+                    patch_labels.append(f"{r+1},{c+1}")
 
-        use_offset = self.color_matrix.use_offset()
-        n_params   = 4 if use_offset else 3
-        if len(A_rows) < n_params:
-            return fail(f"Not enough observations ({len(A_rows)} < {n_params}).")
+        use_offset  = self.color_matrix.use_offset()
+        use_inverse = self.color_matrix.use_inverse()
+        n_params    = 4 if use_offset else 3
+        if len(meas_rows) < n_params:
+            return fail(f"Not enough observations ({len(meas_rows)} < {n_params}).")
 
         with _wait_cursor():
-            A = np.array(A_rows, dtype=np.float64)
-            B = np.array(B_rows, dtype=np.float64)
-            if use_offset:
-                A_aug      = np.hstack([A, np.ones((len(A), 1))])
-                X, _, _, _ = np.linalg.lstsq(A_aug, B, rcond=None)
-                M, offset  = X[:3, :].T, X[3, :]
-                B_pred     = A_aug @ X
+            MEAS = np.array(meas_rows, dtype=np.float64)
+            REF  = np.array(ref_rows,  dtype=np.float64)
+
+            if not use_inverse:
+                # ── Direct: fit M such that M·MEAS ≈ REF ─────────────────────
+                if use_offset:
+                    A_aug      = np.hstack([MEAS, np.ones((len(MEAS), 1))])
+                    X, _, _, _ = np.linalg.lstsq(A_aug, REF, rcond=None)
+                    M_app, offset_app = X[:3, :].T, X[3, :]
+                    residuals_raw     = REF - A_aug @ X
+                else:
+                    X, _, _, _ = np.linalg.lstsq(MEAS, REF, rcond=None)
+                    M_app, offset_app = X.T, None
+                    residuals_raw     = REF - MEAS @ X
+                mode_tag = "direct+offset" if use_offset else "direct"
+
             else:
-                X, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
-                M, offset  = X.T, None
-                B_pred     = A @ X
-            diff     = B - B_pred
+                # ── Inverse: fit F such that F·REF ≈ MEAS, apply F⁻¹ ─────────
+                if use_offset:
+                    A_aug      = np.hstack([REF, np.ones((len(REF), 1))])
+                    X, _, _, _ = np.linalg.lstsq(A_aug, MEAS, rcond=None)
+                    F, f_offset = X[:3, :].T, X[3, :]
+                    residuals_raw = MEAS - A_aug @ X
+                    F_inv      = np.linalg.inv(F)
+                    M_app      = F_inv
+                    offset_app = -F_inv @ f_offset
+                else:
+                    X, _, _, _ = np.linalg.lstsq(REF, MEAS, rcond=None)
+                    F = X.T
+                    residuals_raw = MEAS - REF @ X
+                    M_app     = np.linalg.inv(F)
+                    offset_app = None
+                mode_tag = "inverse+offset" if use_offset else "inverse"
+
+            diff     = residuals_raw                                # (N,3)
             rms_chan = np.sqrt(np.mean(diff ** 2, axis=0))
+            rms_tot  = float(np.sqrt(np.mean(diff ** 2)))
+
             self.color_matrix.setResult(
-                M,
-                (float(rms_chan[0]), float(rms_chan[1]), float(rms_chan[2]), float(np.sqrt(np.mean(diff ** 2)))),
-                offset=offset,
+                M_app,
+                (float(rms_chan[0]), float(rms_chan[1]), float(rms_chan[2]), rms_tot),
+                offset=offset_app,
+                mode_tag=mode_tag,
             )
+
+            # Feed residual chart: (N,4) — R, G, B, total signed (sign = mean sign)
+            tot_signed = np.sign(diff.mean(axis=1)) * np.sqrt((diff**2).mean(axis=1))
+            res_chart  = np.column_stack([diff, tot_signed])       # (N,4)
+            self.residual_chart.setResiduals(res_chart, patch_labels)
+            # Switch to Residuals tab automatically
+            self.right_tabs.setCurrentIndex(1)
+
         self.color_matrix.btn_calc.setEnabled(False)
         self._refresh_save_corrected_btn()
-        # If preview was active, keep it active and refresh with the new matrix
         if self._corrected_mode:
             self.color_matrix.btn_toggle.blockSignals(True)
             self.color_matrix.btn_toggle.setChecked(True)
@@ -3804,7 +4110,8 @@ class MainWindow(QWidget):
         s.setValue("grid/std_thr",         self.grid_settings.spin_std.value())
         s.setValue("grid/cols",            self.grid_settings.spin_cols.value())
         s.setValue("grid/rows",            self.grid_settings.spin_rows.value())
-        s.setValue("matrix/use_offset",    self.color_matrix.chk_offset.isChecked())
+        s.setValue("matrix/use_offset",  self.color_matrix.chk_offset.isChecked())
+        s.setValue("matrix/use_inverse", self.color_matrix.chk_inverse.isChecked())
         s.setValue("paths/last_image_dir", self._last_image_dir)
         s.setValue("paths/last_palette_path", getattr(self.grid_settings, "_loaded_palette_path", ""))
         s.setValue("paths/last_matrix_dir", self._last_matrix_dir)
@@ -3824,10 +4131,10 @@ class MainWindow(QWidget):
             if val is not None:
                 spin.blockSignals(True); spin.setValue(typ(val)); spin.blockSignals(False)
 
-        restore_spin(self.grid_settings.spin_gap,  "grid/gap_pct", float)
-        restore_spin(self.grid_settings.spin_std,  "grid/std_thr", float)
-        restore_spin(self.grid_settings.spin_cols, "grid/cols",    int)
-        restore_spin(self.grid_settings.spin_rows, "grid/rows",    int)
+        restore_spin(self.grid_settings.spin_gap,    "grid/gap_pct",    float)
+        restore_spin(self.grid_settings.spin_std,    "grid/std_thr",    float)
+        restore_spin(self.grid_settings.spin_cols,   "grid/cols",       int)
+        restore_spin(self.grid_settings.spin_rows,   "grid/rows",       int)
         self.zoom_viewer.setGrid(self.grid_settings.spin_cols.value(),
                                  self.grid_settings.spin_rows.value(),
                                  self.grid_settings.spin_gap.value() / 100.0)
@@ -3855,6 +4162,11 @@ class MainWindow(QWidget):
         self.color_matrix.chk_offset.setChecked(bool(use_offset))
         self.color_matrix.chk_offset.blockSignals(False)
         self.color_matrix._on_offset_toggled(bool(use_offset))
+        use_inverse = s.value("matrix/use_inverse", True)
+        if isinstance(use_inverse, str): use_inverse = use_inverse.lower() == "true"
+        self.color_matrix.chk_inverse.blockSignals(True)
+        self.color_matrix.chk_inverse.setChecked(bool(use_inverse))
+        self.color_matrix.chk_inverse.blockSignals(False)
 
     # ── Stylesheet ────────────────────────────────────────────────────────────
 
@@ -3870,6 +4182,14 @@ class MainWindow(QWidget):
             QComboBox#bayerCombo QAbstractItemView {
                 background-color: #1a1a32; color: #c8c8e8;
                 selection-background-color: #2a3a5a;
+            }
+            QToolTip {
+                background-color: #ffffcc;
+                color: #1a1a1a;
+                border: 1px solid #aaaaaa;
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 12px;
+                padding: 3px 6px;
             }
             QWidget {
                 background-color: #0d0d1a;
@@ -3960,6 +4280,21 @@ class MainWindow(QWidget):
             QTableWidget#coordTable QHeaderView::section {
                 background-color: #2a2a4a; color: #9a9abf;
                 padding: 3px; border: none; font-size: 12px;
+            }
+            QTabWidget#rightTabs::pane {
+                border: 1px solid #2a2a4a; background-color: #0d0d1a;
+            }
+            QTabWidget#rightTabs > QTabBar::tab {
+                background-color: #1a1a2e; color: #7a7aaa;
+                padding: 4px 12px; border: 1px solid #2a2a4a;
+                border-bottom: none; border-radius: 4px 4px 0 0;
+                font-size: 12px;
+            }
+            QTabWidget#rightTabs > QTabBar::tab:selected {
+                background-color: #2a2a4a; color: #c8c8e8;
+            }
+            QTabWidget#rightTabs > QTabBar::tab:hover:!selected {
+                background-color: #22223a;
             }
         """)
 
